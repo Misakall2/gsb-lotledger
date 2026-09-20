@@ -146,10 +146,14 @@ class _ReplayState:
             and state.lot.symbol == symbol
             and state.lot.portfolio == portfolio
         ]
-        ordered = sorted(result, key=lambda s: (s.lot.opened_at, s.sequence, s.lot.id))
+        ordered = sorted(result, key=self._lot_order_key)
         if method == "LIFO":
             ordered.reverse()
         return ordered
+
+    @staticmethod
+    def _lot_order_key(state: "_LotState"):
+        return (state.lot.opened_at, state.sequence, state.lot.id)
 
     def open_lot(self, entry: Entry, action: Mapping) -> None:
         lot_id = action["lot_id"]
@@ -199,8 +203,15 @@ class _ReplayState:
         portfolio = action.get("portfolio", DEFAULT_PORTFOLIO)
         method = self.methods.get((portfolio, symbol), "FIFO")
         wanted = as_decimal(action["quantity"])
+        if wanted <= 0:
+            raise OversoldError(
+                f"cannot sell {wanted} {symbol} in portfolio {portfolio}"
+            )
         available = sum(
-            (s.lot.remaining_qty for s in self.open_lots_for(symbol, portfolio, method)),
+            (
+                s.lot.remaining_qty
+                for s in self.open_lots_for(symbol, portfolio, method)
+            ),
             Decimal("0"),
         )
         if wanted > available:
@@ -431,6 +442,11 @@ class Ledger:
         debit_base = sum((leg.amount_base for leg in legs if leg.debit), Decimal("0"))
         credit_base = sum((leg.amount_base for leg in legs if leg.credit), Decimal("0"))
         difference = money(debit_base - credit_base)
+        is_cross_currency = any(leg.currency != self.base_currency for leg in legs)
+        if difference and not is_cross_currency:
+            raise UnbalancedEntryError(
+                f"entry is unbalanced by {difference} {self.base_currency}"
+            )
         if abs(difference) > MAX_PLUG:
             raise UnbalancedEntryError(
                 f"entry is unbalanced by {difference} {self.base_currency}"
@@ -463,6 +479,10 @@ class Ledger:
             raise LedgerError(f"entry {entry_id} already exists")
         if reversal_of and reversal_of not in existing_ids:
             raise LedgerError(f"reversal target {reversal_of} does not exist")
+        if reversal_of and any(
+            existing.reversal_of == reversal_of for existing in self.entries
+        ):
+            raise LedgerError(f"entry {reversal_of} already has a reversal")
         ts = self._check_timestamp(timestamp)
         balanced = self._balanced_legs(legs)
         entry = Entry(
@@ -584,8 +604,10 @@ class Ledger:
         shares = qty(quantity)
         price = as_decimal(unit_price)
         ratio = fx_rate(rate_value)
-        if shares <= 0 or price <= 0:
-            raise LedgerError("sell quantity and price must be positive")
+        if shares <= 0:
+            raise OversoldError("sell quantity must be positive")
+        if price <= 0:
+            raise LedgerError("sell price must be positive")
         proceeds_native = money(shares * price)
         proceeds_base = money(proceeds_native * ratio)
 

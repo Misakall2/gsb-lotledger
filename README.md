@@ -10,8 +10,9 @@ events through `23:59:59.999999` in that timezone.
 
 Every entry stores the transaction currency, the entry-date FX rate to CNY,
 and the CNY amount on each leg. Base-currency debit and credit totals must
-balance. A residual difference of at most `0.02 CNY` is rounded to the `FX`
-account; a larger difference raises `UnbalancedEntryError`.
+balance. Only a cross-currency residual of at most `0.02 CNY` may be posted
+to the `FX` account; a base-currency mismatch or a larger difference raises
+`UnbalancedEntryError`.
 
 Trades create or consume lots per `(portfolio, symbol)`. The cost method is
 chosen on the first buy of a key with `method="FIFO"` (default) or
