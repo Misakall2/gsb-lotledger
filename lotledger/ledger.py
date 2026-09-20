@@ -12,6 +12,8 @@ MONEY = Decimal("0.01")
 QTY = Decimal("0.00000001")
 RATE = Decimal("0.00000001")
 MAX_PLUG = Decimal("0.02")
+DEFAULT_PORTFOLIO = "DEFAULT"
+COST_METHODS = ("FIFO", "LIFO")
 
 
 def as_decimal(value) -> Decimal:
@@ -110,6 +112,7 @@ class Lot:
     unit_cost: Decimal
     entry_id: str
     closed: bool = False
+    portfolio: str = DEFAULT_PORTFOLIO
 
 
 @dataclass
@@ -130,18 +133,36 @@ class _ReplayState:
         self.lots: dict[str, _LotState] = {}
         self.entries_by_id: dict[str, Entry] = {}
         self.splits_by_id: dict[str, Split] = {}
+        self.methods: dict[tuple[str, str], str] = {}
         self.realized = Decimal("0.00")
 
-    def open_lots_for(self, symbol: str) -> list[_LotState]:
+    def open_lots_for(
+        self, symbol: str, portfolio: str, method: str = "FIFO"
+    ) -> list[_LotState]:
         result = [
             state
             for state in self.lots.values()
-            if not state.lot.closed and state.lot.symbol == symbol
+            if not state.lot.closed
+            and state.lot.symbol == symbol
+            and state.lot.portfolio == portfolio
         ]
-        return sorted(result, key=lambda s: (s.lot.opened_at, s.sequence, s.lot.id))
+        ordered = sorted(result, key=lambda s: (s.lot.opened_at, s.sequence, s.lot.id))
+        if method == "LIFO":
+            ordered.reverse()
+        return ordered
 
     def open_lot(self, entry: Entry, action: Mapping) -> None:
         lot_id = action["lot_id"]
+        portfolio = action.get("portfolio", DEFAULT_PORTFOLIO)
+        method = action.get("method", "FIFO")
+        key = (portfolio, action["symbol"])
+        existing = self.methods.get(key)
+        if existing is not None and existing != method:
+            raise LedgerError(
+                f"{action['symbol']} in portfolio {portfolio} already uses "
+                f"{existing}; cannot switch to {method}"
+            )
+        self.methods[key] = method
         lot = Lot(
             id=lot_id,
             symbol=action["symbol"],
@@ -152,6 +173,7 @@ class _ReplayState:
             remaining_cost=as_decimal(action["cost_base"]),
             unit_cost=as_decimal(action["cost_base"]) / as_decimal(action["quantity"]),
             entry_id=entry.id,
+            portfolio=portfolio,
         )
         self.lots[lot_id] = _LotState(lot=lot, sequence=int(action["sequence"]))
 
@@ -169,19 +191,26 @@ class _ReplayState:
             unit_cost=lot.unit_cost,
             entry_id=lot.entry_id,
             closed=True,
+            portfolio=lot.portfolio,
         )
 
     def sell(self, action: Mapping) -> None:
         symbol = action["symbol"]
+        portfolio = action.get("portfolio", DEFAULT_PORTFOLIO)
+        method = self.methods.get((portfolio, symbol), "FIFO")
         wanted = as_decimal(action["quantity"])
         available = sum(
-            (s.lot.remaining_qty for s in self.open_lots_for(symbol)), Decimal("0")
+            (s.lot.remaining_qty for s in self.open_lots_for(symbol, portfolio, method)),
+            Decimal("0"),
         )
         if wanted > available:
-            raise OversoldError(f"cannot sell {wanted} {symbol}; {available} remain")
+            raise OversoldError(
+                f"cannot sell {wanted} {symbol} in portfolio {portfolio}; "
+                f"{available} remain"
+            )
 
         allocations = []
-        for state in self.open_lots_for(symbol):
+        for state in self.open_lots_for(symbol, portfolio, method):
             if wanted <= 0:
                 break
             lot = state.lot
@@ -204,6 +233,7 @@ class _ReplayState:
                 unit_cost=lot.unit_cost,
                 entry_id=lot.entry_id,
                 closed=new_qty == 0,
+                portfolio=lot.portfolio,
             )
             allocations.append(
                 {
@@ -244,6 +274,7 @@ class _ReplayState:
                 unit_cost=new_cost / new_qty,
                 entry_id=lot.entry_id,
                 closed=False,
+                portfolio=lot.portfolio,
             )
         self.realized -= as_decimal(original.action["realized_pnl"])
 
@@ -262,10 +293,15 @@ class _ReplayState:
     def apply_split(self, split: Split) -> None:
         for state in self.lots.values():
             lot = state.lot
-            if lot.closed or lot.symbol != split.symbol:
+            if lot.symbol != split.symbol:
+                continue
+            # Scale tracks every corporate action since the lot opened, even
+            # for closed lots, so a later reversal returns the current
+            # (post-split) number of shares.
+            state.scale *= split.ratio
+            if lot.closed:
                 continue
             new_quantity = qty(lot.remaining_qty * split.ratio)
-            state.scale *= split.ratio
             state.lot = Lot(
                 id=lot.id,
                 symbol=lot.symbol,
@@ -277,16 +313,18 @@ class _ReplayState:
                 unit_cost=lot.remaining_cost / new_quantity,
                 entry_id=lot.entry_id,
                 closed=False,
+                portfolio=lot.portfolio,
             )
 
-    def positions(self) -> dict[str, _Position]:
-        result: dict[str, _Position] = {}
+    def positions_by_portfolio(self) -> dict[tuple[str, str], _Position]:
+        result: dict[tuple[str, str], _Position] = {}
         for state in self.lots.values():
             lot = state.lot
             if lot.closed:
                 continue
-            previous = result.get(lot.symbol, _Position(Decimal("0"), Decimal("0")))
-            result[lot.symbol] = _Position(
+            key = (lot.portfolio, lot.symbol)
+            previous = result.get(key, _Position(Decimal("0"), Decimal("0")))
+            result[key] = _Position(
                 qty(previous.quantity + lot.remaining_qty),
                 money(previous.cost_base + lot.remaining_cost),
             )
@@ -466,6 +504,8 @@ class Ledger:
         rate_value,
         cash_account: str,
         *,
+        portfolio: str = DEFAULT_PORTFOLIO,
+        method: str | None = None,
         memo: str = "",
     ) -> Entry:
         self._require_account(cash_account)
@@ -474,6 +514,7 @@ class Ledger:
         ratio = fx_rate(rate_value)
         if shares <= 0 or price <= 0:
             raise LedgerError("buy quantity and price must be positive")
+        chosen_method = self._resolve_method(portfolio, symbol, method)
         gross = money(shares * price)
         cost_base = money(gross * ratio)
         self._lot_seq += 1
@@ -499,10 +540,31 @@ class Ledger:
             "cost_base": str(cost_base),
             "lot_id": lot_id,
             "sequence": self._lot_seq,
+            "portfolio": portfolio,
+            "method": chosen_method,
         }
         return self._append(
             entry_id, timestamp, legs, memo=memo, kind="buy", action=action
         )
+
+    def _resolve_method(self, portfolio: str, symbol: str, method: str | None) -> str:
+        """Pick the cost method for a (portfolio, symbol), locking it on first open."""
+        chosen = None
+        if method is not None:
+            chosen = str(method).upper()
+            if chosen not in COST_METHODS:
+                raise LedgerError(
+                    f"method must be one of {COST_METHODS}, got {method!r}"
+                )
+        existing = self._replay().methods.get((portfolio, symbol))
+        if existing is not None:
+            if chosen is not None and chosen != existing:
+                raise LedgerError(
+                    f"{symbol} in portfolio {portfolio} already uses {existing}; "
+                    f"cannot switch to {chosen}"
+                )
+            return existing
+        return chosen or "FIFO"
 
     def sell(
         self,
@@ -515,6 +577,7 @@ class Ledger:
         rate_value,
         cash_account: str,
         *,
+        portfolio: str = DEFAULT_PORTFOLIO,
         memo: str = "",
     ) -> Entry:
         self._require_account(cash_account)
@@ -533,6 +596,7 @@ class Ledger:
             "quantity": str(shares),
             "proceeds_base": str(proceeds_base),
             "realized_pnl": "0.00",
+            "portfolio": portfolio,
         }
         trial.sell(action)
         cost_base = money(
@@ -626,11 +690,85 @@ class Ledger:
         old = as_decimal(old_shares)
         if new <= 0 or old <= 0:
             raise LedgerError("split ratio parts must be positive")
-        self._event_seq += 1
         split = Split(split_id, ts, symbol, new, old, memo, sequence=self._event_seq)
+        self._event_seq += 1
         self.splits.append(split)
         self._replay()
         return split
+
+    def rights_issue(
+        self,
+        entry_id: str,
+        timestamp: datetime,
+        symbol: str,
+        new_shares,
+        old_shares,
+        *,
+        memo: str = "",
+    ) -> Entry:
+        """Bonus-style rights issue: more shares, same total cost, lower unit cost.
+
+        ``new_shares``/``old_shares`` is the allotment ratio: for every
+        ``old_shares`` held, ``new_shares`` bonus shares are issued, so open
+        quantities are multiplied by ``(old + new) / old``.
+        Every open lot of the symbol (across all portfolios) is scaled by
+        that factor. A self-balancing memo entry on the investment
+        account records the affected cost basis, so the books stay balanced
+        while total CNY cost is unchanged. Like any event, it cannot be dated
+        inside a locked month; book it in the next open period instead.
+        """
+        new = as_decimal(new_shares)
+        old = as_decimal(old_shares)
+        if new <= 0 or old <= 0:
+            raise LedgerError("rights issue ratio parts must be positive")
+        state = self._replay()
+        affected = money(
+            sum(
+                (
+                    lot_state.lot.remaining_cost
+                    for lot_state in state.lots.values()
+                    if not lot_state.lot.closed and lot_state.lot.symbol == symbol
+                ),
+                Decimal("0"),
+            )
+        )
+        if affected <= 0:
+            raise LedgerError(f"no open lots for {symbol}; nothing to adjust")
+        legs = [
+            {
+                "account": self.investment_account,
+                "debit": affected,
+                "currency": self.base_currency,
+                "fx_rate": 1,
+            },
+            {
+                "account": self.investment_account,
+                "credit": affected,
+                "currency": self.base_currency,
+                "fx_rate": 1,
+            },
+        ]
+        action = {
+            "type": "rights_issue",
+            "symbol": symbol,
+            "new_shares": str(new),
+            "old_shares": str(old),
+        }
+        text = memo or f"rights issue {symbol} {old} for {new}"
+        entry = self._append(
+            entry_id, timestamp, legs, memo=text, kind="rights_issue", action=action
+        )
+        split_id = f"{entry_id}-SPLIT"
+        if split_id in {split.id for split in self.splits}:
+            raise LedgerError(f"split {split_id} already exists")
+        ts = self._check_timestamp(entry.timestamp)
+        split = Split(
+            split_id, ts, symbol, new + old, old, text, sequence=self._event_seq
+        )
+        self._event_seq += 1
+        self.splits.append(split)
+        self._replay()
+        return entry
 
     def reverse_entry(
         self,
@@ -697,7 +835,6 @@ class Ledger:
         if any(split.reversal_of == original_id for split in self.splits):
             raise LedgerError(f"split {original_id} already has a reversal")
         self._check_timestamp(ts)
-        self._event_seq += 1
         reversal = Split(
             reversal_id,
             ts,
@@ -708,6 +845,7 @@ class Ledger:
             original_id,
             self._event_seq,
         )
+        self._event_seq += 1
         self.splits.append(reversal)
         self._replay()
         return reversal
@@ -786,13 +924,44 @@ class Ledger:
             tzinfo=self.timezone,
         )
 
-    def positions_at(self, date_value) -> dict[str, dict[str, Decimal]]:
-        """Return quantity and CNY cost per symbol at ledger end-of-day."""
+    def positions_at(
+        self, date_value, portfolio: str | None = None
+    ) -> dict[str, dict[str, Decimal]]:
+        """Return quantity and CNY cost per symbol at ledger end-of-day.
+
+        With ``portfolio`` set, only lots of that portfolio are aggregated.
+        """
         cutoff = self._day_cutoff(date_value)
+        totals: dict[str, _Position] = {}
+        for (pf, symbol), pos in (
+            self._replay(cutoff).positions_by_portfolio().items()
+        ):
+            if portfolio is not None and pf != portfolio:
+                continue
+            previous = totals.get(symbol, _Position(Decimal("0"), Decimal("0")))
+            totals[symbol] = _Position(
+                qty(previous.quantity + pos.quantity),
+                money(previous.cost_base + pos.cost_base),
+            )
         return {
             symbol: {"quantity": pos.quantity, "cost_base": pos.cost_base}
-            for symbol, pos in self._replay(cutoff).positions().items()
+            for symbol, pos in totals.items()
         }
+
+    def positions_by_portfolio(
+        self, date_value
+    ) -> dict[str, dict[str, dict[str, Decimal]]]:
+        """Return end-of-day quantity and CNY cost grouped by portfolio, then symbol."""
+        cutoff = self._day_cutoff(date_value)
+        result: dict[str, dict[str, dict[str, Decimal]]] = {}
+        for (pf, symbol), pos in (
+            self._replay(cutoff).positions_by_portfolio().items()
+        ):
+            result.setdefault(pf, {})[symbol] = {
+                "quantity": pos.quantity,
+                "cost_base": pos.cost_base,
+            }
+        return result
 
     def lot_remaining(self, lot_id: str, date_value=None) -> Lot:
         cutoff = self._day_cutoff(date_value) if date_value is not None else None

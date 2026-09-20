@@ -5,6 +5,7 @@ from zoneinfo import ZoneInfo
 
 from lotledger import (
     Ledger,
+    LedgerError,
     LockedPeriodError,
     OversoldError,
     UnbalancedEntryError,
@@ -236,4 +237,203 @@ class LedgerTestCase(TestCase):
                 "10",
                 "7",
                 "CASH_USD",
+            )
+
+
+class MultiPortfolioTestCase(TestCase):
+    def make_ledger(self):
+        ledger = Ledger()
+        ledger.add_account("CASH_USD")
+        return ledger
+
+    def test_same_symbol_portfolios_never_share_lots(self):
+        ledger = self.make_ledger()
+        ledger.buy(
+            "B-A", ts(2026, 8, 3), "AAPL", "100", "USD", "10", "7", "CASH_USD",
+            portfolio="P-A",
+        )
+        ledger.buy(
+            "B-B", ts(2026, 8, 4), "AAPL", "100", "USD", "12", "7", "CASH_USD",
+            portfolio="P-B",
+        )
+
+        sale = ledger.sell(
+            "S-B", ts(2026, 8, 10), "AAPL", "100", "USD", "13", "7", "CASH_USD",
+            portfolio="P-B",
+        )
+        self.assertEqual(sale.action["allocations"][0]["lot_id"], "LOT-000002")
+        self.assertEqual(sale.action["cost_base"], "8400.00")
+        self.assertEqual(sale.action["realized_pnl"], "700.00")
+
+        grouped = ledger.positions_by_portfolio(date(2026, 8, 10))
+        self.assertEqual(
+            grouped["P-A"]["AAPL"],
+            {"quantity": Decimal("100.00000000"), "cost_base": Decimal("7000.00")},
+        )
+        self.assertNotIn("P-B", grouped)
+
+        # P-B is flat; P-A still holds 100 shares, but they cannot be stolen.
+        with self.assertRaises(OversoldError):
+            ledger.sell(
+                "S-STEAL", ts(2026, 8, 11), "AAPL", "1", "USD", "13", "7",
+                "CASH_USD", portfolio="P-B",
+            )
+
+    def test_positions_at_can_filter_by_portfolio(self):
+        ledger = self.make_ledger()
+        ledger.buy(
+            "B-A", ts(2026, 8, 3), "AAPL", "100", "USD", "10", "7", "CASH_USD",
+            portfolio="P-A",
+        )
+        ledger.buy(
+            "B-B", ts(2026, 8, 4), "AAPL", "50", "USD", "12", "7", "CASH_USD",
+            portfolio="P-B",
+        )
+
+        combined = ledger.positions_at(date(2026, 8, 4))
+        self.assertEqual(combined["AAPL"]["quantity"], Decimal("150.00000000"))
+        self.assertEqual(combined["AAPL"]["cost_base"], Decimal("11200.00"))
+        only_a = ledger.positions_at(date(2026, 8, 4), portfolio="P-A")
+        self.assertEqual(only_a["AAPL"]["quantity"], Decimal("100.00000000"))
+        self.assertEqual(only_a["AAPL"]["cost_base"], Decimal("7000.00"))
+
+
+class CostMethodTestCase(TestCase):
+    def make_ledger(self):
+        ledger = Ledger()
+        ledger.add_account("CASH_USD")
+        return ledger
+
+    def test_lifo_consumes_newest_lot_first(self):
+        ledger = self.make_ledger()
+        ledger.buy(
+            "B1", ts(2026, 8, 3), "AAPL", "100", "USD", "10", "7", "CASH_USD",
+            method="LIFO",
+        )
+        ledger.buy(
+            "B2", ts(2026, 8, 4), "AAPL", "100", "USD", "12", "7", "CASH_USD",
+            method="LIFO",
+        )
+        sale = ledger.sell(
+            "S1", ts(2026, 8, 10), "AAPL", "150", "USD", "11", "7", "CASH_USD"
+        )
+
+        self.assertEqual(sale.action["allocations"][0]["lot_id"], "LOT-000002")
+        self.assertEqual(sale.action["allocations"][0]["quantity"], "100.00000000")
+        self.assertEqual(sale.action["allocations"][0]["cost_base"], "8400.00")
+        self.assertEqual(sale.action["allocations"][1]["lot_id"], "LOT-000001")
+        self.assertEqual(sale.action["allocations"][1]["quantity"], "50.00000000")
+        self.assertEqual(sale.action["allocations"][1]["cost_base"], "3500.00")
+        self.assertEqual(sale.action["realized_pnl"], "-350.00")
+        self.assertEqual(
+            ledger.lot_remaining("LOT-000001").remaining_qty, Decimal("50.00000000")
+        )
+        self.assertTrue(ledger.lot_remaining("LOT-000002").closed)
+
+    def test_method_is_locked_once_the_position_is_opened(self):
+        ledger = self.make_ledger()
+        ledger.buy(
+            "B1", ts(2026, 8, 3), "AAPL", "100", "USD", "10", "7", "CASH_USD",
+            method="FIFO",
+        )
+        with self.assertRaises(LedgerError):
+            ledger.buy(
+                "B2", ts(2026, 8, 4), "AAPL", "100", "USD", "12", "7", "CASH_USD",
+                method="LIFO",
+            )
+        # Omitting the method inherits the locked one.
+        ledger.buy("B3", ts(2026, 8, 4), "AAPL", "100", "USD", "12", "7", "CASH_USD")
+        self.assertEqual(ledger.get_entry("B3").action["method"], "FIFO")
+
+        # A different portfolio of the same symbol chooses independently.
+        ledger.buy(
+            "B4", ts(2026, 8, 5), "AAPL", "10", "USD", "10", "7", "CASH_USD",
+            portfolio="P-B", method="LIFO",
+        )
+        with self.assertRaises(LedgerError):
+            ledger.buy(
+                "B5", ts(2026, 8, 6), "AAPL", "10", "USD", "10", "7", "CASH_USD",
+                portfolio="P-B", method="FIFO",
+            )
+        with self.assertRaises(LedgerError):
+            ledger.buy(
+                "B6", ts(2026, 8, 6), "AAPL", "10", "USD", "10", "7", "CASH_USD",
+                portfolio="P-C", method="WEIGHTED",
+            )
+
+
+class RightsIssueTestCase(TestCase):
+    def make_ledger(self):
+        ledger = Ledger()
+        ledger.add_account("CASH_USD")
+        return ledger
+
+    def test_rights_issue_scales_lots_and_posts_balanced_entry(self):
+        ledger = self.make_ledger()
+        ledger.buy("B1", ts(2026, 8, 1), "AAPL", "100", "USD", "10", "7", "CASH_USD")
+
+        entry = ledger.rights_issue(
+            "RI1", ts(2026, 8, 15), "AAPL", new_shares=1, old_shares=1
+        )
+        self.assertEqual(entry.kind, "rights_issue")
+        debit_base = sum(leg.amount_base for leg in entry.legs if leg.debit)
+        credit_base = sum(leg.amount_base for leg in entry.legs if leg.credit)
+        self.assertEqual(debit_base, credit_base)
+        self.assertEqual(debit_base, Decimal("7000.00"))
+
+        lot = ledger.lot_remaining("LOT-000001", date(2026, 8, 15))
+        self.assertEqual(lot.remaining_qty, Decimal("200.00000000"))
+        self.assertEqual(lot.remaining_cost, Decimal("7000.00"))
+        self.assertEqual(lot.unit_cost, Decimal("35.00"))
+
+        # Selling after the issue uses the diluted unit cost.
+        sale = ledger.sell(
+            "S1", ts(2026, 8, 20), "AAPL", "200", "USD", "8", "7", "CASH_USD"
+        )
+        self.assertEqual(sale.action["cost_base"], "7000.00")
+        self.assertEqual(sale.action["realized_pnl"], "4200.00")
+        self.assertNotIn("AAPL", ledger.positions_at(date(2026, 8, 20)))
+
+    def test_rights_issue_applies_to_every_portfolio_of_the_symbol(self):
+        ledger = self.make_ledger()
+        ledger.buy(
+            "B-A", ts(2026, 8, 1), "AAPL", "100", "USD", "10", "7", "CASH_USD",
+            portfolio="P-A",
+        )
+        ledger.buy(
+            "B-B", ts(2026, 8, 2), "AAPL", "50", "USD", "12", "7", "CASH_USD",
+            portfolio="P-B",
+        )
+        ledger.rights_issue("RI1", ts(2026, 8, 15), "AAPL", new_shares=1, old_shares=2)
+
+        grouped = ledger.positions_by_portfolio(date(2026, 8, 15))
+        self.assertEqual(grouped["P-A"]["AAPL"]["quantity"], Decimal("150.00000000"))
+        self.assertEqual(grouped["P-A"]["AAPL"]["cost_base"], Decimal("7000.00"))
+        self.assertEqual(grouped["P-B"]["AAPL"]["quantity"], Decimal("75.00000000"))
+        self.assertEqual(grouped["P-B"]["AAPL"]["cost_base"], Decimal("4200.00"))
+
+    def test_rights_issue_cannot_touch_a_locked_period(self):
+        ledger = self.make_ledger()
+        ledger.buy("B1", ts(2026, 8, 1), "AAPL", "100", "USD", "10", "7", "CASH_USD")
+        ledger.lock_month(2026, 8)
+
+        with self.assertRaises(LockedPeriodError):
+            ledger.rights_issue(
+                "RI-AUG", ts(2026, 8, 31), "AAPL", new_shares=1, old_shares=1
+            )
+        # History is untouched; the corporate action is booked next period.
+        self.assertEqual(
+            ledger.lot_remaining("LOT-000001", date(2026, 8, 31)).remaining_qty,
+            Decimal("100.00000000"),
+        )
+        ledger.rights_issue("RI-SEP", ts(2026, 9, 1), "AAPL", new_shares=1, old_shares=1)
+        self.assertEqual(
+            ledger.lot_remaining("LOT-000001").remaining_qty, Decimal("200.00000000")
+        )
+
+    def test_rights_issue_requires_open_lots(self):
+        ledger = self.make_ledger()
+        with self.assertRaises(LedgerError):
+            ledger.rights_issue(
+                "RI1", ts(2026, 8, 15), "AAPL", new_shares=1, old_shares=1
             )
