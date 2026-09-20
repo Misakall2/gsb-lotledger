@@ -239,6 +239,121 @@ class LedgerTestCase(TestCase):
                 "CASH_USD",
             )
 
+    def test_same_day_fifo_uses_append_sequence_on_repeated_replays(self):
+        ledger = self.make_ledger()
+        when = ts(2026, 8, 6)
+        ledger.buy("B3", when, "AAPL", "100", "USD", "12", "7", "CASH_USD")
+        ledger.buy("B2", when, "AAPL", "100", "USD", "10", "7", "CASH_USD")
+        ledger.buy("B1", when, "AAPL", "100", "USD", "11", "7", "CASH_USD")
+
+        sale = ledger.sell("S1", when, "AAPL", "150", "USD", "11", "7", "CASH_USD")
+        expected = [
+            ("LOT-000001", "100.00000000", "8400.00"),
+            ("LOT-000002", "50.00000000", "3500.00"),
+        ]
+        actual = [
+            (item["lot_id"], item["quantity"], item["cost_base"])
+            for item in sale.action["allocations"]
+        ]
+        self.assertEqual(actual, expected)
+
+        ledger.split_shares("SPLIT1", ts(2026, 8, 7), "AAPL", 2, 1)
+        replayed = [
+            item["lot_id"]
+            for item in ledger.get_entry("S1").action["allocations"]
+        ]
+        self.assertEqual(replayed, ["LOT-000001", "LOT-000002"])
+
+    def test_fx_rounding_rule_only_applies_to_cross_currency_entries(self):
+        ledger = self.make_ledger()
+        entry = ledger.post(
+            "FX1",
+            ts(2026, 8, 2),
+            [
+                {"account": "SECURITIES", "debit": "100.00", "currency": "CNY"},
+                {
+                    "account": "CASH_USD",
+                    "credit": "14.00",
+                    "currency": "USD",
+                    "fx_rate": "7.14285714",
+                    "amount_base": "99.99",
+                },
+            ],
+        )
+        self.assertEqual(entry.legs[-1].account, "FX")
+        self.assertEqual(entry.legs[-1].amount_base, Decimal("0.01"))
+
+        with self.assertRaises(UnbalancedEntryError):
+            ledger.post(
+                "CNY-ROUND",
+                ts(2026, 8, 3),
+                [
+                    {"account": "SECURITIES", "debit": "100.00"},
+                    {"account": "CASH_USD", "credit": "99.99"},
+                ],
+            )
+
+    def test_locked_month_reversal_is_later_period_and_references_original_once(self):
+        ledger = self.make_ledger()
+        ledger.buy("B1", ts(2026, 8, 1), "AAPL", "1", "USD", "10", "7", "CASH_USD")
+        sale = ledger.sell(
+            "S1", ts(2026, 8, 1), "AAPL", "1", "USD", "10", "7", "CASH_USD"
+        )
+        ledger.lock_month(2026, 8)
+
+        with self.assertRaises(LockedPeriodError):
+            ledger.reverse_entry("BAD-REV", ts(2026, 8, 31), "S1")
+
+        reversal = ledger.reverse_entry("REV-S1", ts(2026, 9, 1), "S1")
+        self.assertEqual(reversal.timestamp, ts(2026, 9, 1))
+        self.assertEqual(reversal.reversal_of, "S1")
+        with self.assertRaises(LedgerError):
+            ledger.reverse_entry("REV-S1-AGAIN", ts(2026, 9, 2), "S1")
+
+    def test_split_partial_sale_uses_decimal_cost_and_preserves_total(self):
+        ledger = self.make_ledger()
+        ledger.buy("B1", ts(2026, 8, 1), "AAPL", "1", "USD", "100", "1", "CASH_USD")
+        ledger.split_shares("SPLIT1", ts(2026, 8, 15), "AAPL", 3, 1)
+
+        sale = ledger.sell(
+            "S1", ts(2026, 8, 20), "AAPL", "2", "USD", "40", "1", "CASH_USD"
+        )
+        remaining = ledger.lot_remaining("LOT-000001")
+
+        self.assertIsInstance(remaining.unit_cost, Decimal)
+        self.assertEqual(sale.action["cost_base"], "66.67")
+        self.assertEqual(remaining.remaining_qty, Decimal("1.00000000"))
+        self.assertEqual(remaining.remaining_cost, Decimal("33.33"))
+        self.assertEqual(
+            remaining.remaining_cost + Decimal(sale.action["cost_base"]),
+            Decimal("100.00"),
+        )
+
+    def test_zero_or_excess_sell_always_raises_without_creating_an_entry(self):
+        ledger = self.make_ledger()
+        ledger.buy("B1", ts(2026, 8, 1), "AAPL", "100", "USD", "10", "7", "CASH_USD")
+
+        for quantity in ("0", "100.00000001"):
+            with self.subTest(quantity=quantity):
+                with self.assertRaises(OversoldError):
+                    ledger.sell(
+                        f"S-{quantity}",
+                        ts(2026, 8, 2),
+                        "AAPL",
+                        quantity,
+                        "USD",
+                        "11",
+                        "7",
+                        "CASH_USD",
+                    )
+
+        with self.assertRaises(LedgerError):
+            ledger.get_entry("S-0")
+        self.assertEqual(
+            ledger.lot_remaining("LOT-000001").remaining_qty,
+            Decimal("100.00000000"),
+        )
+
 
 class MultiPortfolioTestCase(TestCase):
     def make_ledger(self):
